@@ -454,3 +454,125 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Review Notes — Questions, Clarifications & Simplifications
+
+*Added by a documentation review pass. Items are grouped by how much they block work. Each question is numbered so answers can be recorded inline. Findings were checked against the already-built `backend/app/market/` code, so several items are contradictions between this plan and shipped behaviour rather than hypotheticals.*
+
+### A. Blocking contradictions — these will produce wrong code if left as-is
+
+**A1. "Daily change %" has no data source.**
+§10 requires the watchlist to show *daily change %*. The only percentage available is `PriceUpdate.change_percent`, which is **tick-over-tick** (change since the last 500ms update) — a number that will read ±0.05% and jitter constantly. Nothing in the system records a session open or previous close.
+→ *Decision needed:* add an `open_price` (captured at process start / first tick) to `PriceCache`, and emit `day_change` + `day_change_percent` alongside the existing tick fields. Otherwise change §10 to say "change since last tick" and accept that the number is visually meaningless.
+
+**A2. The SSE payload shape in §6 doesn't match what's implemented.**
+§6 says "Each SSE event contains ticker, price, previous price, timestamp, and change direction" — i.e. one event per ticker. `backend/app/market/stream.py` actually sends **one event containing a map of all tickers**: `data: {"AAPL": {...}, "GOOGL": {...}}`. The frontend agent will build the wrong parser from this document.
+→ Update §6 to document the map-of-tickers payload, the `retry: 1000` directive, and the fact that events are only sent when `PriceCache.version` changes.
+
+**A3. The LLM cannot report a failed trade in the same message.**
+§9 says "If a trade fails validation, the error is included in the chat response so the LLM can inform the user." This is impossible in the described single-call flow: the LLM writes `message` *before* step 6 executes the trades. A rejected buy will still be accompanied by "Done — bought 10 AAPL."
+→ *Decision needed:* either (a) render execution results as a separate structured block in the chat bubble, distinct from the LLM's prose, and word the system prompt so the model never claims completion ("I'll buy 10 AAPL" not "I bought"); or (b) make a second LLM call with the execution results. (a) is cheaper and keeps the one-call latency story. Recommend (a), and rewrite the §9 sentence accordingly.
+
+**A4. Nothing connects the watchlist to the market data source.**
+`POST /api/watchlist` writes a DB row. `MarketDataSource.add_ticker()` is a separate call. §8 and §6 never say who wires them together, and §6's "all tickers known to the system" is ambiguous.
+→ Specify explicitly: **tracked tickers = watchlist ∪ tickers with a non-zero position.** This matters because removing a ticker from the watchlist while holding shares would otherwise stop its price updates and break portfolio valuation. Say so in §6, and say that watchlist mutations call through to the source.
+
+**A5. Unknown tickers get a random price that changes on every restart.**
+`simulator._add_ticker_internal` falls back to `random.uniform(50.0, 300.0)` for any ticker not in `SEED_PRICES`. §9's own example has the LLM adding PYPL. Combined with a persistent SQLite volume, a position bought at $180 can be worth $62 after a container restart — the P&L chart will show a cliff that isn't a bug in the portfolio code.
+→ *Decision needed:* seed unknown tickers deterministically (hash the symbol) **and/or** persist last-known prices to the DB on shutdown and reload on start. Also decide whether arbitrary symbols are accepted at all, or validated against an allowlist. See also B3.
+
+**A6. Timestamp formats are inconsistent across the wire.**
+The DB schema (§7) uses ISO 8601 strings; `PriceUpdate.timestamp` is a float of Unix seconds. The frontend will receive both and needs two parsers.
+→ Pick one convention and state it: recommend **ISO 8601 UTC everywhere in REST responses, epoch seconds only in the SSE hot path** (documented as such), or convert at the SSE boundary.
+
+### B. Underspecified — two agents will make different, incompatible choices
+
+**B1. Missing endpoints.** §8's table omits things the UI in §10 requires:
+- `GET /api/chat/history` — §10 specifies a "scrolling conversation history" and §7 persists `chat_messages` across restarts, but there's no way to load it on page load.
+- `GET /api/trades` — the `trades` table is append-only and never read. A trading terminal with no blotter is a conspicuous omission; either add the endpoint and a blotter panel, or state that trades are intentionally only visible via positions and chat.
+- Portfolio reset. The volume persists, so after a demo the user is stuck with whatever the AI did to their $10k. Right now the only reset is `docker volume rm finally-data`. Either add `POST /api/portfolio/reset` or document the volume command in §11 and the README.
+
+**B2. `GET /api/portfolio/history` takes no parameters and grows without bound.**
+Snapshots every 30s = 2,880 rows/day, ~20k/week, in a volume designed to persist. The P&L chart will eventually fetch megabytes.
+→ Specify `?since=` / `?limit=` (or a fixed window like "last 6 hours"), plus a retention or downsampling rule. Also worth asking: does the 30s cadence earn itself, or would 60s plus on-every-trade be indistinguishable in the chart?
+
+**B3. Ticker validation on `POST /api/watchlist` is undefined.**
+Uppercase normalisation? Length/charset limit? Duplicate handling (409 vs idempotent 200)? Max watchlist size (the Cholesky rebuild is O(n²) and the code comments assume n < 50)? What happens under `MASSIVE_API_KEY` when the symbol doesn't exist at Polygon — does the add fail, or silently produce a ticker that never prices?
+
+**B4. Trade validation rules aren't stated.**
+Needed: reject `quantity <= 0`; reject non-finite values; behaviour when the price cache has no entry for the ticker (a just-added symbol before its first tick) — reject with a clear error rather than filling at 0. Can the user trade a ticker that isn't on the watchlist (the §10 trade bar is a free-text ticker field, implying yes)? If so, does trading auto-add to the watchlist?
+
+**B5. Money and float precision.**
+Cash and quantities are `REAL`. "Sell everything" via repeated float subtraction leaves residuals like `1e-14` shares.
+→ State the rule: round cash to cents on write; **delete the position row when `abs(quantity) < 1e-9`**; round displayed prices to 2dp. Also state that `avg_cost` is unchanged by sells (only buys move it) and that realized P&L is deliberately not tracked — it shows up implicitly in cash and the total-value chart.
+
+**B6. "Total value" needs one definition.**
+Define once, at the top of §7 or §8: `total_value = cash_balance + Σ(quantity × current_price)`, prices from `PriceCache`, tickers with no cached price excluded (or valued at `avg_cost` — pick one). Then say how the **header** stays live: recomputed client-side from the SSE stream, or polled from `/api/portfolio`? Only the former can update at 500ms, and if it isn't specified the two numbers on screen will disagree.
+
+**B7. Database path and local (non-Docker) development.**
+§4 says the backend writes to a volume at `/app/db`. That path doesn't exist on a developer's Mac, and agents will develop this outside Docker. §5 lists no `DATABASE_PATH` variable.
+→ Add `DATABASE_PATH` to §5 with a repo-relative default (`db/finally.db`) and the container override (`/app/db/finally.db`).
+Relatedly: §5 says "the backend reads `.env` from the project root", but `uv run` is executed from `backend/` — say explicitly that the loader walks up one level, or move to `--env-file`.
+
+**B8. The dev-mode CORS claim isn't true.**
+"All API calls go to the same origin — no CORS configuration needed" (§10) holds only for the built static export. During development the Next.js dev server is on :3000 and FastAPI on :8000 — different origins.
+→ Document the intended dev setup: `rewrites()` in `next.config.js` proxying `/api/*` to `localhost:8000`. This is a five-line config that will otherwise cost an agent an hour.
+
+**B9. `SQLite` concurrency is not addressed.**
+There will be at least two background tasks (price source, snapshotter) plus request handlers plus LLM-triggered writes, and FastAPI async handlers calling blocking `sqlite3` will stall the event loop — including the SSE stream.
+→ State the approach in §7: WAL mode, `check_same_thread=False`, DB calls dispatched to a threadpool, and a lock (or a single `BEGIN IMMEDIATE` transaction) around the read-modify-write of cash + position during a trade, since buy validation is a check-then-act race.
+
+**B10. Chat context budget is unbounded.** §9 says "recent conversation history" without a number. Specify (e.g. last 20 messages, or a token budget), and whether tool/action results are included in history.
+
+**B11. Behaviour without `OPENROUTER_API_KEY`.** §5 marks it required, but the app should still boot and stream prices with only the chat panel degraded. State the expected failure: startup warning, `/api/chat` returns a clear error the UI renders, everything else works.
+
+**B12. Massive API realities are glossed over.** Three questions:
+- Which Polygon endpoint? "Poll for the union of all watched tickers" at 15s on a 5-calls/min tier only works if that's **one grouped snapshot call**, not ten per-ticker calls (which would allow a poll every two minutes).
+- Cadence mismatch: SSE pushes at 500ms but real data refreshes every 15s, so 29 of every 30 frames are flat. Sparklines become step functions and flashes nearly stop. Worth stating as expected behaviour so it isn't debugged as a bug.
+- **Market hours.** Outside 09:30–16:00 ET and on weekends, real data is frozen and the entire terminal looks dead. This is the single biggest demo risk in the optional path. Recommend documenting it, and consider falling back to the simulator when the market is closed.
+
+**B13. Price history survives nothing.** Sparklines and the main chart are accumulated on the frontend from SSE since page load (§2, §10), so every refresh empties both charts while the P&L chart (server-persisted) keeps its history. That asymmetry will look broken.
+→ *Consider:* a bounded ring buffer (e.g. last 600 ticks/ticker ≈ 5 min) inside `PriceCache` plus `GET /api/history/{ticker}`. ~30 lines of server code, and it serves the sparkline *and* the main chart *and* survives reload. Recommended — see C4.
+
+### C. Simplification opportunities
+
+**C1. Two directories named `db` is a trap.** §4 has `backend/db/` (schema and seed *code*) and top-level `db/` (the SQLite *file*). Agents will conflate them, and `backend/db/` sitting outside `backend/app/` breaks the package layout the wheel build already declares (`packages = ["app"]`).
+→ Move schema/seed code to `backend/app/db/` and keep top-level `db/` purely as the volume mount. One rename, removes a whole class of confusion.
+
+**C2. Have mutating endpoints return the new state.** `POST /api/portfolio/trade`, `POST/DELETE /api/watchlist`, and `POST /api/chat` should each return the updated portfolio/watchlist. Removes a follow-up `GET` after every action and eliminates the window where the UI shows stale numbers.
+
+**C3. Drop prices from `GET /api/watchlist`.** §8 says it returns "tickers with latest prices", but prices already arrive continuously over SSE. Two sources of truth for the same number means they will visibly disagree during the first second after load. Return tickers (and metadata) only; let SSE own price.
+
+**C4. One price-history mechanism instead of two.** Adopting B13's server-side ring buffer collapses "sparkline data" and "main chart data" into a single endpoint and deletes the frontend's accumulate-since-page-load special case. Fewer moving parts *and* better behaviour.
+
+**C5. One error shape.** Standardise on FastAPI's `{"detail": "..."}` for every 4xx/5xx and say so once, so the frontend has exactly one error path rather than per-endpoint handling.
+
+**C6. Rename the scripts.** `start_mac.sh` also targets Linux (§4 says so). Call them `scripts/start.sh` / `stop.sh` and `scripts/start.ps1` / `stop.ps1`.
+
+**C7. Note that `actions` on `chat_messages` is deliberate denormalisation.** It duplicates rows in `trades`. That's the right call for rendering inline confirmations without a join, but say it's intentional or a reviewer will file it as a bug.
+
+### D. Docker & build details worth pinning down (§11)
+
+- `npm install` → **`npm ci`**, which requires `frontend/package-lock.json` to be committed. Same rationale as the `uv.lock` already in the repo.
+- Stage 2 should be `uv sync --frozen --no-dev` so lockfile drift fails the build and test tooling stays out of the image.
+- Name the static path (`/app/static`) and specify the **SPA fallback**: unknown non-`/api` routes serve `index.html`; unknown `/api/*` routes 404 as JSON. Getting the mount order wrong here (catch-all shadowing `/api`) is the classic failure.
+- `uvicorn --host 0.0.0.0` — trivial, and universally forgotten.
+- Next.js `output: 'export'` disables API routes and image optimization; set `images: { unoptimized: true }` and decide on `trailingSlash` to match however FastAPI serves the files.
+- Add a `HEALTHCHECK` hitting `/api/health`, and run as a non-root user.
+- §3's diagram says "Background task" (singular) but there are at least two — market data and the snapshotter. Minor, but the diagram is what agents skim.
+
+### E. Testing gaps (§12)
+
+- **There is no CI that runs tests.** `.github/workflows/` currently contains only the two Claude Code review workflows. Nothing runs `pytest`, `ruff`, the frontend unit tests, or Playwright on a PR. Worth adding, and worth stating a coverage floor (the market data module landed at 84%).
+- **E2E state isolation is unspecified.** Tests need a clean $10k/10-ticker database each run. Say how: a fresh anonymous volume per `docker-compose.test.yml` run, `DATABASE_PATH` pointed at a tmpfs, or a reset endpoint (B1).
+- **"SSE resilience: disconnect and verify reconnection"** needs a stated mechanism — Playwright `context.setOffline(true)` or `page.route()` aborting the stream — otherwise the test will be written as a sleep.
+- The market data path is already well covered (73 tests); the plan should name the *new* risky areas for equivalent rigour: trade validation edge cases, the LLM structured-output parser against malformed/partial JSON, and concurrent trade + snapshot writes.
+
+### F. Housekeeping
+
+- **`.env.example` is referenced in §4 as committed but does not exist in the repo.** It's the first thing a new user needs. Should list `OPENROUTER_API_KEY`, `MASSIVE_API_KEY`, `LLM_MOCK`, and (per B7) `DATABASE_PATH`.
+- Seed prices (AAPL ~$190 etc.) are anchored to an older market. Harmless for the simulator, but if a user sets `MASSIVE_API_KEY` mid-session prices will jump discontinuously. One sentence in §6 is enough.
+- §2 promises "the user runs a single Docker command (or a provided start script)" and "a browser opens" — confirm whether the start script auto-opens the browser (§11 says "optionally"). Pick one so the README is accurate.
+- **The agent handoff contract is asserted but not defined.** §1 says "Agents interact through files in `planning/`" without specifying how. The market data component established a good pattern worth codifying: publish an interface/design doc *before* implementing, and a `<COMPONENT>_SUMMARY.md` after, with the older docs moved to `planning/archive/`. Since demonstrating orchestrated agents is the entire point of the project, this convention deserves to be stated rather than inferred.
