@@ -1,0 +1,73 @@
+# FinAlly — E2E test stack (planning/E2E_PLAN.md).
+#
+# Separate from the production Dockerfile/docker-compose.yml on purpose
+# (PLAN §12): keeps Playwright's browser dependencies out of the
+# production image. Builds the real root Dockerfile fresh every run --
+# never reuses a cached/pulled image, so a stale image can't hide a
+# regression that was just fixed in source.
+#
+# Isolation from the demo container the user may have running:
+#   - own container names (finally-e2e-app / finally-e2e-playwright)
+#   - own image tag (finally-e2e), never `finally:latest`
+#   - own host port (8100), never 8000
+#   - own tmpfs "volume" for /app/db, never the `finally-data` volume
+#
+# Run from the repo root:
+#   docker compose -f test/docker-compose.test.yml up --build \
+#     --abort-on-container-exit --exit-code-from playwright
+#   docker compose -f test/docker-compose.test.yml down -v
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: finally-e2e:latest
+    container_name: finally-e2e-app
+    environment:
+      - LLM_MOCK=true
+      - DATABASE_PATH=/app/db/finally.db
+      # Explicitly blank: LLM_MOCK=true never calls out, and mock mode
+      # doesn't require a key, but set it empty (not unset) so this stack
+      # never accidentally inherits a real key from the host shell.
+      - OPENROUTER_API_KEY=
+      - MASSIVE_API_KEY=
+    # In-memory, wiped on every `up` -- the primary state-isolation
+    # mechanism (E2E_PLAN.md §2). Never the `finally-data` named volume.
+    # Long syntax (not the short `tmpfs:` list form) so `mode: "1777"`
+    # can be set: a bare tmpfs mount replaces the image's pre-chowned
+    # `/app/db` (uid 1000) with a fresh root-owned mount, and the
+    # container runs as non-root uid 1000 (Dockerfile) -- world-writable
+    # + sticky bit (mirroring how /tmp is normally mounted) is what lets
+    # that uid create finally.db here. Without this the container fails
+    # to start at all: `sqlite3.OperationalError: unable to open database
+    # file` (found by actually running this compose file).
+    volumes:
+      - type: tmpfs
+        target: /app/db
+        tmpfs:
+          mode: 0o1777
+    ports:
+      # Host access for local debugging only; the playwright service
+      # below talks to this over the compose network, not this mapping.
+      - "8100:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      start_period: 5s
+      retries: 20
+
+  playwright:
+    image: mcr.microsoft.com/playwright:v1.48.0-jammy
+    container_name: finally-e2e-playwright
+    depends_on:
+      app:
+        condition: service_healthy
+    working_dir: /work
+    volumes:
+      - ./:/work
+    environment:
+      - BASE_URL=http://app:8000
+      - CI=true
+    command: sh -c "npm ci && npx playwright test"
