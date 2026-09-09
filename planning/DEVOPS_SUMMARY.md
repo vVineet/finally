@@ -5,11 +5,12 @@ serves the real frontend; `docker compose up` works; the volume, non-root
 user, healthcheck, and `--no-dev` dependency pruning are all confirmed
 against the shipped image.
 
-**One real bug was found and is NOT fixed here, because it lives in
-`backend/app/main.py`, outside this scope: the SPA fallback and the
-`/api/*` JSON-404 shape are both broken by `StaticFiles(html=True)`
-serving Next's `404.html`.** See "3. SPA fallback / `/api` 404 shape"
-below for the proof and the suggested one-line fix.
+**One real bug was found here and has since been FIXED (commit
+`d18b778`): the SPA fallback and the `/api/*` JSON-404 shape were both
+broken by `StaticFiles(html=True)` serving Next's `404.html`.** It was
+reported rather than fixed in this pass because it lives in
+`backend/app/main.py`, outside DevOps scope. See "3. SPA fallback /
+`/api` 404 shape" below for the proof; the resolution is recorded there.
 
 Design rationale for every decision below was published first in
 `planning/DEVOPS_DESIGN.md` (per PLAN §13.F's agent-handoff convention).
@@ -250,8 +251,22 @@ excluding only paths `.dockerignore` already excludes (`.git`,
 byte-identical to the repo's (3610 bytes), as were `next.config.ts`,
 `package.json`, and `package-lock.json`. The build below is therefore the
 real `Dockerfile` against the real sources; only the context *directory*
-differs. **This is worth re-running once host access is restored**, purely
-to remove the staging step from the chain of evidence.
+differed.
+
+**Resolved.** The cause was a declined macOS permission prompt: denying it
+records a persistent deny in the TCC database for the Downloads folder
+(one of the three protected folders), and macOS never re-prompts after a
+deny — it just returns `EPERM` silently. Cleared with `tccutil reset
+SystemPolicyDownloadsFolder` for `com.microsoft.VSCode` and
+`com.anthropic.claude-code`, then re-granted by the user. **The entire
+build and runtime verification below was then re-run from the repo
+directory itself with no staging**, and reproduced identically — including
+the bug in §3. The staged-context step is no longer part of the evidence
+chain for any result in this document.
+
+Worth noting for the future: keeping this project under `~/Downloads`
+leaves it exposed to the same class of fault. `~/code` or `~/Developer`
+is not TCC-gated.
 
 ### 1. Real multi-stage build — PASSES
 
@@ -357,6 +372,17 @@ $ docker exec finally-probe rm /app/static/404.html
   /spa/route  status=200 bytes=13586 type=text/html; charset=utf-8
 ```
 
+**RESOLVED in commit `d18b778`.** `html=True` was dropped from the mount,
+and `tests/api/test_static_mount.py`'s fixture now includes a `404.html`
+so the case is actually exercised — the gap that let this reach a built
+image. Verified by reintroducing `html=True` and confirming both tests
+fail before restoring the fix, then by rebuilding the image: unmatched
+`/api/*` now returns `{"detail":"Not Found"}` as 22 bytes of JSON (was
+6386 bytes of HTML) and a deep SPA route returns `index.html` at 200
+(was `404.html` at 404).
+
+Original report follows.
+
 **This is `backend/app/main.py`, which is outside the DevOps scope — not
 fixed here, reported instead.** Suggested fix for the Backend API
 Engineer: drop `html=True` from the `StaticFiles` mount. The exception
@@ -418,10 +444,15 @@ is present, as explained above — it is a transitive runtime dependency of
   GitHub Actions runner; it needs a PR to prove it. Its frontend
   `npm test --if-present` step remains a no-op until a `test` script exists
   in `frontend/package.json`.
-- The end-to-end build should be re-run from the repo directory itself once
-  the host filesystem fault is cleared, to remove the staged-context step
-  from the evidence chain (the artifacts themselves need no change for
-  this).
+
+## Known inefficiency (not a defect, deliberately not changed)
+
+The `chown -R finally:finally /app` layer costs ~288MB of the image,
+because chowning rewrites every file in the venv into a new layer.
+`COPY --chown=finally:finally` on the individual copies (plus creating
+`/app/db` already-owned) would avoid the duplication. Left alone in this
+pass because changing it would invalidate the verification above; worth
+doing as a standalone follow-up with a re-run of the same checks.
 
 ## Constraints honored
 
