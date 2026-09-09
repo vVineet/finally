@@ -1,0 +1,43 @@
+# FinAlly — build context exclusions for `docker build` (repo root context).
+# Keeps the context small and prevents stale/local artifacts from leaking
+# into a stage that's supposed to build them fresh.
+
+.git
+.github
+
+# Planning docs / E2E infra — not needed in the image.
+planning
+test
+
+# Root-level dev files not needed in the image.
+.env
+.env.*
+!.env.example
+README.md
+LICENSE
+
+# --- Frontend ---
+frontend/node_modules
+frontend/.next
+frontend/out
+frontend/npm-debug.log*
+
+# --- Backend ---
+backend/.venv
+backend/**/__pycache__
+backend/**/*.py[cod]
+backend/.pytest_cache
+backend/.ruff_cache
+backend/.coverage
+backend/htmlcov
+backend/tests
+backend/market_data_demo.py
+
+# --- Runtime data ---
+db/*.db
+db/*.db-*
+
+# Editor/OS cruft
+.DS_Store
+.vscode
+.idea

@@ -61,6 +61,12 @@ local_settings.py
 db.sqlite3
 db.sqlite3-journal
 
+# FinAlly SQLite runtime volume (PLAN.md §4, §11) -- db/ itself is tracked
+# (see db/.gitkeep) so the mount point exists in a fresh checkout, but the
+# actual database file and its WAL/SHM sidecars are runtime state, not source.
+db/*.db
+db/*.db-*
+
 # Flask stuff:
 instance/
 .webassets-cache
