@@ -120,7 +120,13 @@ def create_app(static_dir: Path | None | object = _UNSET) -> FastAPI:
     # Absent/missing directory degrades gracefully (no frontend build yet in
     # this stage) rather than crashing StaticFiles' check_dir=True. ---
     if resolved_static_dir is not None and resolved_static_dir.is_dir():
-        app.mount("/", StaticFiles(directory=resolved_static_dir, html=True), name="static")
+        # NOT html=True: in that mode Starlette *returns* 404.html on a miss
+        # instead of *raising* HTTPException, so _http_exception_handler below
+        # never runs -- breaking both the /api JSON 404 shape (C5) and the SPA
+        # fallback. Next's static export always emits a 404.html, so this is
+        # not hypothetical. The handler serves index.html for "/" and deep
+        # links on its own.
+        app.mount("/", StaticFiles(directory=resolved_static_dir), name="static")
     else:
         logger.warning(
             "Static directory %s not found; frontend will not be served "

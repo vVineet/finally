@@ -1,17 +1,22 @@
 # FinAlly — DevOps Summary
 
-Status: **partial pass, as scoped**. `frontend/` was being created concurrently
-by the Frontend Engineer during this stage and does not yet have
-`output: 'export'` configured, so the real multi-stage image cannot build
-end-to-end yet. Every artifact below is written complete and correct, as if
-the frontend export existed; everything verifiable without it was actually
-run, not just written. See "What remains unverified" for the exact list of
-what needs a second pass once the frontend lands.
+Status: **complete and verified end-to-end.** The image builds, runs, and
+serves the real frontend; `docker compose up` works; the volume, non-root
+user, healthcheck, and `--no-dev` dependency pruning are all confirmed
+against the shipped image.
+
+**One real bug was found and is NOT fixed here, because it lives in
+`backend/app/main.py`, outside this scope: the SPA fallback and the
+`/api/*` JSON-404 shape are both broken by `StaticFiles(html=True)`
+serving Next's `404.html`.** See "3. SPA fallback / `/api` 404 shape"
+below for the proof and the suggested one-line fix.
 
 Design rationale for every decision below was published first in
 `planning/DEVOPS_DESIGN.md` (per PLAN §13.F's agent-handoff convention).
 This document covers what was actually built and the real results of
-running it.
+running it. The sections up to "Follow-up pass" record the original pass,
+written while `frontend/` did not yet exist; "Follow-up pass" records the
+real end-to-end verification once it landed.
 
 ## What was built
 
@@ -219,38 +224,204 @@ carefully by hand, mirroring the already-verified `.sh` logic 1:1, but this
 is the one script-level check that's genuinely unverified (listed below,
 not hidden).
 
-## What remains unverified (deferred to the follow-up pass)
+## Follow-up pass — real end-to-end verification (frontend has landed)
 
-1. **The real multi-stage `Dockerfile` end-to-end.** `frontend/next.config.ts`
-   does not yet set `output: 'export'` (confirmed by reading the file — it's
-   still the scaffold default), so `npm run build` in stage 1 will not
-   produce `frontend/out/`, and the real `docker build -t finally .` cannot
-   succeed yet. Everything stage 2 does was proven separately (see above);
-   what's unverified is specifically the handoff between the two stages —
-   that `COPY --from=frontend-builder /app/frontend/out ./static` actually
-   finds files there once the frontend sets `output: 'export'`.
-2. **`docker-compose up`** end-to-end (blocked by the same dependency).
-3. **The SPA fallback serving real `index.html` content** for a client-side
-   route — proven only that it degrades correctly when no static build
-   exists; not proven against an actual built export yet.
-4. **`trailingSlash`** — `planning/FRONTEND_SUMMARY.md` does not exist yet,
-   so whatever the Frontend Engineer decides is unknown. No Dockerfile
-   change is anticipated either way, but worth a joint check once that file
-   lands in case the static export's internal links and the backend's SPA
-   fallback disagree on trailing slashes.
-5. **`start.ps1` / `stop.ps1`** — written to mirror the verified `.sh`
-   logic exactly, but not run through a PowerShell parser or a real Windows
-   Docker Desktop instance (neither available in this environment).
-6. **The new CI workflow (`tests.yml`)** has not run on an actual GitHub
-   Actions runner (no push/PR triggered from this stage) — its YAML
-   structure was hand-reviewed and its constituent commands
-   (`uv sync --extra dev`, `uv run pytest -q`, `uv run ruff check`, `npm ci`)
-   were exercised locally in isolation (see the pytest/ruff run in
-   `planning/BACKEND_SUMMARY.md`, and the `npm ci` / lockfile presence
-   confirmed above), but the workflow file itself is unverified until a PR
-   actually runs it. The frontend `npm test --if-present` step is a no-op
-   today since `frontend/package.json` has no `test` script yet — expected,
-   not a bug, and explained in `planning/DEVOPS_DESIGN.md`.
+The frontend is committed, `frontend/next.config.ts` sets `output: "export"` /
+`images.unoptimized` / `trailingSlash: false`, and the LLM integration has
+added litellm to the dependency tree. Everything deferred above was re-run
+for real. **One genuine bug was found — see the next section.**
+
+### Environment caveat (how the build context was obtained)
+
+Partway through this pass the host shell lost macOS-level access to
+everything under `~/Downloads` (the repo's location): `open()` on any
+pre-existing file and `readdir()` on any directory both return `Operation
+not permitted`, while `stat()` still resolves and brand-new files are
+readable. `git status` fails with `fatal: Unable to read current working
+directory`. This reproduces identically with the tool sandbox on and off,
+so it is an OS/TCC-level fault, not a repo problem and not caused by any
+artifact here.
+
+Docker Desktop's file-sharing daemon holds its own access grant and can
+still read the repo, so the build context was staged through a container
+(`docker run -v <repo>:/src:ro -v <tmp>:/dst alpine tar -cf - -C /src . | tar -xf - -C /dst`),
+excluding only paths `.dockerignore` already excludes (`.git`,
+`node_modules`, `.venv`, caches). The staged `Dockerfile` was confirmed
+byte-identical to the repo's (3610 bytes), as were `next.config.ts`,
+`package.json`, and `package-lock.json`. The build below is therefore the
+real `Dockerfile` against the real sources; only the context *directory*
+differs. **This is worth re-running once host access is restored**, purely
+to remove the staging step from the chain of evidence.
+
+### 1. Real multi-stage build — PASSES
+
+```
+$ docker build -t finally .
+#13 [frontend-builder 4/6] RUN npm ci                     DONE 29.4s
+#19 [frontend-builder 6/6] RUN npm run build
+#19  ▲ Next.js 16.3.4 (webpack)
+#19  ✓ Compiled successfully in 13.9s
+#19  ✓ Generating static pages using 5 workers (4/4) in 893ms
+#19 DONE 39.8s
+#20 [backend 7/8] COPY --from=frontend-builder /app/frontend/out ./static   DONE
+#21 [backend 8/8] RUN groupadd ... useradd ... chown -R                     DONE 13.5s
+#22 naming to docker.io/library/finally:latest done
+```
+Both stages complete; the `out/` handoff between them works. The
+`rewrites will not automatically work with "output: export"` notice is the
+expected one the Frontend Engineer documented, not an error. `next build
+--webpack` was left exactly as pinned — not changed to `next build`.
+
+### 2. `docker compose up` — PASSES
+
+```
+$ docker compose up -d
+ Container finally Started
+$ docker compose ps
+finally   finally   "/app/.venv/bin/uvic…"   Up 10 seconds (health: starting)   0.0.0.0:8000->8000/tcp
+  /api/health   status=200 type=application/json
+  /             status=200 bytes=13586
+$ docker compose exec -T finally id
+uid=1000(finally) gid=1000(finally) groups=1000(finally)
+compose healthcheck: healthy
+$ docker compose down     # volume survives
+local     finally-data
+```
+One cosmetic note: Compose warns `volume "finally-data" already exists but
+was not created by Docker Compose` when the volume was created first by
+`scripts/start.sh`. It still binds the correct volume (the pre-existing
+`finally.db` and a test file written by the earlier `docker run` were both
+visible inside the compose-managed container). Switching the volume to
+`external: true` would silence it but would make `docker compose up` fail
+on a clean machine where the volume doesn't exist yet, so the warning is
+deliberately left in place as the better trade.
+
+### 3. SPA fallback / `/api` 404 shape — **FAILS. Real bug, in backend code.**
+
+This is the check that exists to catch the mount-ordering class of
+regression, and it caught one. It could not have been caught before,
+because it only manifests once a real static export is present — which is
+exactly why re-running it after the frontend landed was the right call.
+
+Observed, against the real image:
+
+```
+  /api/does-not-exist      status=404 bytes=6386 type=text/html; charset=utf-8
+  /api/portfolio/nope      status=404 bytes=6386 type=text/html; charset=utf-8
+  /api/                    status=404 bytes=6386 type=text/html; charset=utf-8
+  /nonexistent-page        status=404 bytes=6386 type=text/html; charset=utf-8
+  /some/deep/spa/route     status=404 bytes=6386 type=text/html; charset=utf-8
+
+$ curl -sS http://localhost:8000/api/does-not-exist | head -c 120
+<!DOCTYPE html><html lang="en" class="h-full"><head><meta charSet="utf-8"/>...
+```
+
+6386 bytes is `404.html`; `index.html` is 13586. So:
+
+- **Unmatched `/api/*` returns an HTML page instead of `{"detail": ...}`
+  JSON.** This breaks the "one error shape everywhere" contract in
+  `API_CONTRACT.md` — a frontend doing `response.json().detail` throws a
+  JSON parse error instead of reading a string.
+- **Unmatched non-`/api` paths serve `404.html` with status 404, not
+  `index.html` with 200**, so the SPA fallback does not actually work. Any
+  deep link / client-side route is broken.
+
+Real API routes are unaffected — `/api/health`, `/api/portfolio`,
+`/api/watchlist`, `/api/trades` all return `200 application/json` — and
+`/` correctly serves `index.html` (13586 bytes). So this is *not* the
+classic "catch-all shadows the API routers" ordering bug; the router
+ordering in `main.py` is correct.
+
+**Root cause, proven by controlled experiment.** `main.py` mounts
+`StaticFiles(directory=..., html=True)`. In `html=True` mode Starlette's
+`StaticFiles`, on a miss, looks for `404.html` in the served directory and
+**returns** it as a 404 response rather than **raising**
+`HTTPException(404)`. Because nothing is raised, `main.py`'s
+`StarletteHTTPException` handler — which holds both the `/api` JSON-404
+branch and the `index.html` SPA branch — never runs at all. Next.js's
+static export always emits `404.html`, so the file is always present.
+
+Removing only that one file from a running container flips both behaviours
+back to correct, with no other change:
+
+```
+=== BEFORE (404.html present) ===
+  /api/nope   status=404 bytes=6386 type=text/html; charset=utf-8
+  /spa/route  status=404 bytes=6386
+
+$ docker exec finally-probe rm /app/static/404.html
+
+=== AFTER (404.html gone) ===
+  /api/nope   status=404 bytes=22 type=application/json
+  body: {"detail":"Not Found"}
+  /spa/route  status=200 bytes=13586 type=text/html; charset=utf-8
+```
+
+**This is `backend/app/main.py`, which is outside the DevOps scope — not
+fixed here, reported instead.** Suggested fix for the Backend API
+Engineer: drop `html=True` from the `StaticFiles` mount. The exception
+handler already implements both behaviours correctly, including serving
+`index.html` for `/` (a bare `/` misses, raises 404, and the handler's
+non-`/api` branch serves `index.html`). A `StaticFiles` subclass that
+raises instead of serving `404.html` would also work. Deleting `404.html`
+during the Docker build was deliberately **not** done — it would paper
+over an application bug from the outside and leave the same broken
+behaviour in local non-Docker runs.
+
+`backend/tests/api/test_static_mount.py` currently passes because its
+fixture static directory contains no `404.html`; a regression test should
+add one.
+
+### 4. Non-root + volume write, on the real image — PASSES
+
+```
+$ docker exec finally id
+uid=1000(finally) gid=1000(finally) groups=1000(finally)
+$ docker exec finally sh -c "touch /app/db/write-test && ls -la /app/db"
+-rw-r--r-- 1 finally finally 73728 finally.db
+-rw-r--r-- 1 finally finally     0 write-test
+$ docker inspect --format='{{.State.Health.Status}}' finally
+healthy
+```
+The backend created and wrote `finally.db` (73728 bytes) into the mounted
+named volume as uid 1000 — the volume-ownership setup works on the real
+image, and `DATABASE_PATH=/app/db/finally.db` resolves as intended. The
+static export is present at `/app/static`, owned by `finally`, with
+`index.html` at 13586 bytes.
+
+### 5. `uv sync --frozen --no-dev` with litellm — PASSES
+
+The lockfile resolved cleanly inside the build with litellm in the tree.
+Inspecting the **shipped image**:
+
+```
+$ docker run --rm --entrypoint /app/.venv/bin/python finally -c "..."
+litellm    present=True
+fastapi    present=True
+uvicorn    present=True
+numpy      present=True
+openai     present=True
+pytest     present=False
+ruff       present=False
+pytest_asyncio present=False
+pytest_cov present=False
+```
+`/app/.venv/bin` contains no `pytest` or `ruff` executable either. (`httpx`
+is present, as explained above — it is a transitive runtime dependency of
+`openai`/`litellm`, not the dev extra leaking in.)
+
+### Still unverified after this pass
+
+- **`scripts/start.ps1` / `scripts/stop.ps1`** — no `pwsh` and no Windows
+  Docker Desktop available in this environment. Not checked, not faked.
+- **`.github/workflows/tests.yml`** has still never executed on a real
+  GitHub Actions runner; it needs a PR to prove it. Its frontend
+  `npm test --if-present` step remains a no-op until a `test` script exists
+  in `frontend/package.json`.
+- The end-to-end build should be re-run from the repo directory itself once
+  the host filesystem fault is cleared, to remove the staged-context step
+  from the evidence chain (the artifacts themselves need no change for
+  this).
 
 ## Constraints honored
 

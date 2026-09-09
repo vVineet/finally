@@ -25,6 +25,10 @@ def static_dir(tmp_path):
     static = tmp_path / "static"
     static.mkdir()
     (static / "index.html").write_text("<html><body>FinAlly SPA</body></html>")
+    # Next's static export always emits a 404.html. Without it in the fixture
+    # these tests pass even when StaticFiles(html=True) is swallowing 404s,
+    # which is exactly how that bug reached a built image undetected.
+    (static / "404.html").write_text("<html><body>Next 404</body></html>")
     (static / "favicon.ico").write_bytes(b"\x00")
     return static
 
