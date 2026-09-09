@@ -29,7 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.staticfiles import StaticFiles
 
-from app.api import chat, health, portfolio, register_exception_handlers, trades, watchlist
+from app.api import chat, health, history, portfolio, register_exception_handlers, trades, watchlist
 from app.db import init_db
 from app.market import PriceCache, create_market_data_source, create_stream_router
 from app.portfolio import get_tracked_tickers, snapshot_loop
@@ -101,6 +101,7 @@ def create_app(static_dir: Path | None | object = _UNSET) -> FastAPI:
     app.include_router(watchlist.router)
     app.include_router(trades.router)
     app.include_router(chat.router)
+    app.include_router(history.router)
     app.include_router(create_stream_router(price_cache))
 
     register_exception_handlers(app)

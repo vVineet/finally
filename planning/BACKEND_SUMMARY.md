@@ -4,8 +4,10 @@ Status: **done** (except `POST /api/chat`'s handler body, explicitly left
 to the LLM Engineer — the route, request validation, and full target
 contract are in place). Implements PLAN.md §8 (API Endpoints) plus the
 §13.B1 additions (`GET /api/chat/history`, `GET /api/trades`, `POST
-/api/portfolio/reset`), and the binding review decisions A4, A6, B2, B4,
-B6, C2, C3, C5, and §13.D.
+/api/portfolio/reset`), two follow-up additions after coordinator
+course-corrections — §13.B13/C4 (`GET /api/history/{ticker}`) and §13.A1
+(`day_change`/`day_change_percent` on the SSE stream) — and the binding
+review decisions A4, A6, B2, B4, B6, C2, C3, C5, and §13.D.
 
 Full request/response contract lives in `planning/API_CONTRACT.md` —
 that's the document the Frontend and LLM engineers should code against.
@@ -40,6 +42,8 @@ backend/app/api/
     trades.py       GET /api/trades
     chat.py         GET /api/chat/history (implemented), POST /api/chat
                     (stub, 501, contract documented)
+    history.py      GET /api/history/{ticker} (§13.B13/C4, added in a
+                    follow-up pass -- see below)
 
 backend/app/main.py
     create_app(static_dir=...) factory + module-level `app`. Lifespan:
@@ -52,9 +56,26 @@ backend/app/main.py
     (frontend/ doesn't exist yet in this stage -- verified not to crash).
 
 backend/tests/portfolio/   13 tests (valuation, tracking, snapshotter)
-backend/tests/api/         37 tests (health, watchlist, portfolio, trades,
-                            chat, static mount ordering)
+backend/tests/api/         43 tests (health, watchlist, portfolio, trades,
+                            chat, static mount ordering, history)
+backend/tests/market/      3 new files, added alongside the pre-existing
+                            test_cache.py/test_models.py rather than
+                            editing them:
+                              test_cache_history.py       7 tests
+                              test_cache_day_change.py    7 tests
+                              test_models_day_change.py   6 tests
 ```
+
+Two small, backward-compatible additions to the market data component
+(coordinated, not a rewrite -- see the binding-decision entries below for
+exactly what changed and why neither breaks the existing 73-test suite):
+- `app/market/cache.py`: the `HISTORY_MAXLEN`-deep ring buffer (`GET
+  /api/history/{ticker}`) and per-ticker `open_price` tracking
+  (`day_change`/`day_change_percent`).
+- `app/market/models.py`: `PriceUpdate` gained an optional `open_price`
+  field (default `None`) and the `day_change`/`day_change_percent`
+  properties, included in `to_dict()`. `app/market/stream.py` was **not**
+  touched -- it already serializes whatever `to_dict()` returns.
 
 ## Binding decisions — how each was implemented
 
@@ -104,6 +125,35 @@ backend/tests/api/         37 tests (health, watchlist, portfolio, trades,
   serves `index.html` when a static build exists; a missing static
   directory (this stage's actual state — `frontend/` doesn't exist)
   degrades to plain JSON 404s everywhere without crashing `create_app()`.
+- **§13.B13/C4** (added in a follow-up pass, after the coordinator flagged
+  it was missing from the original brief): `PriceCache` in
+  `app/market/cache.py` now keeps a `collections.deque(maxlen=600)` per
+  ticker, appended to inside the same lock `update()` already takes (O(1)
+  append, deque's own `maxlen` eviction — no extra bookkeeping, no
+  meaningful hot-path cost) and evicted in `remove()`. `GET
+  /api/history/{ticker}` reads it via the new `PriceCache.get_history()`
+  and returns `{"ticker", "points": [{"t", "price"}, ...]}` oldest-first,
+  `200` with `"points": []` for an unknown/never-ticked ticker (not a
+  404 — a just-added ticker legitimately has no history yet). `t` is the
+  one deliberate exception to A6's `"+00:00"` convention: ISO 8601 UTC
+  with millisecond precision and a literal `"Z"` suffix, to match the
+  exact contract specified by the coordinator (the Frontend Engineer was
+  already coding against it). `limit` defaults to and caps at 600 (422
+  outside `1..600`).
+- **§13.A1** (second follow-up, same batch): `PriceCache` now also tracks
+  an `open_price` per ticker (a separate dict, populated on that ticker's
+  first `update()` since construction or since its last `remove()`, never
+  overwritten after). `PriceUpdate` exposes `day_change`/
+  `day_change_percent` computed against it, using the exact field names
+  the Frontend Engineer specified and is already coding against. Both are
+  `0.0` (never a `ZeroDivisionError`/`NaN`) when there's no open price yet
+  or it's `0` — same defensive pattern as the existing `change_percent`.
+  Documented explicitly in `planning/API_CONTRACT.md` that "day" here
+  means "since this process started tracking the ticker," not a true
+  market previous-close (the simulator has no such concept, and even
+  under `MASSIVE_API_KEY` it's "price at first poll this process made,"
+  not the exchange's actual prior close) — so the UI should label it
+  something like "since session start," not "1D %".
 
 ## A design note beyond the binding decisions
 
@@ -154,33 +204,63 @@ from. Worth flagging since it's an easy mistake to reintroduce if
 
 ```
 $ uv run --extra dev pytest -q
-181 passed in 3.85s
+208 passed in 5.36s
 ```
-(132 pre-existing in `tests/db` + `tests/market` — untouched, still
-passing; 49 new: 13 in `tests/portfolio`, 36 in `tests/api`.)
+(132 pre-existing in `tests/db` + `tests/market` — all still passing, no
+regressions to the market data suite; 76 new: 13 in `tests/portfolio`, 43
+in `tests/api`, 20 in `tests/market` across the three new files listed
+above.)
 
 ```
 $ uv run --extra dev ruff check app/ tests/
 All checks passed!
 ```
 
-Coverage of the new code (`pytest tests/api tests/portfolio --cov=app.api
---cov=app.portfolio --cov=app.main --cov-report=term-missing`): **97%**
-(302/312 statements). The gaps are two `Depends`-injector function bodies
-that are always replaced via `dependency_overrides` in tests except the
-one real-lifespan test (which doesn't happen to call them), the `STATIC_DIR`
-env-var branch in `main.py` (trivial), and 4 lines in the background
-snapshot loop's exception-logging branch (would need to inject a DB
-failure mid-loop to exercise, not worth the complexity for a defensive
-path — same call made in `planning/DATABASE_SUMMARY.md` for the analogous
-case in `reset_portfolio`).
+Coverage of the original stage-2 code (`pytest tests/api tests/portfolio
+--cov=app.api --cov=app.portfolio --cov=app.main --cov-report=term-missing`):
+**97%** (302/312 statements). The gaps are two `Depends`-injector function
+bodies that are always replaced via `dependency_overrides` in tests except
+the one real-lifespan test (which doesn't happen to call them), the
+`STATIC_DIR` env-var branch in `main.py` (trivial), and 4 lines in the
+background snapshot loop's exception-logging branch (would need to inject
+a DB failure mid-loop to exercise, not worth the complexity for a
+defensive path — same call made in `planning/DATABASE_SUMMARY.md` for the
+analogous case in `reset_portfolio`). Full-repo coverage (`pytest
+--cov=app --cov-report=term-missing`, 208 tests): **96%**; `app/api/
+history.py` is 100%, `app/market/cache.py` 98% (one unreachable defensive
+branch), `app/market/models.py` 100%.
+
+One flaky test surfaced only under coverage instrumentation's added
+overhead and was fixed: `test_snapshot_loop_runs_periodically_until_cancelled`
+used a fixed `sleep(0.05)` against a `0.01`s loop interval, which is a
+timing assumption that doesn't hold when execution is slower (coverage
+tracing, a loaded CI box). Rewrote it to poll for the expected snapshot
+count with a generous bounded timeout instead of a fixed sleep. Confirmed
+green both with and without `--cov` afterward.
 
 ## Constraints honored
 
-- No changes to `backend/app/db/`, `backend/app/market/`, or their tests.
+- `backend/app/db/` untouched, including its tests.
+- `backend/app/market/` was touched, but only as explicitly directed by
+  the coordinator in two follow-up messages, scoped to exactly
+  `cache.py` (ring buffer + open-price tracking) and `models.py`
+  (`PriceUpdate`'s new optional field + properties) — both
+  backward-compatible additions (new fields default to values that
+  reproduce the old behavior; nothing existing was renamed, removed, or
+  had its signature changed in a breaking way). `app/market/stream.py`,
+  `simulator.py`, `massive_client.py`, `factory.py`, `interface.py`,
+  `seed_prices.py`, and every existing test under `tests/market/` were
+  **not** modified — new behavior was added via new test files instead of
+  editing the pre-existing ones, per the pattern already established by
+  `planning/DATABASE_SUMMARY.md` for its own seed-resurrection fix. The
+  full pre-existing 73-test market suite still passes unmodified.
 - `backend/app/db/repository.py`'s `execute_trade` price argument is
   always supplied by looking up `PriceCache` in `app/api/portfolio.py` —
   `app/db` still has no import of `app/market`.
+- `app/api/chat.py` was not touched (owned by the LLM Engineer in
+  parallel); `app/api/__init__.py` only gained one more router import
+  (`history`) alongside the pre-existing `chat` import.
+- `frontend/`, `Dockerfile`, `scripts/` untouched.
 - Did not run `git commit` — left for review as instructed.
 
 ## Files touched
@@ -188,18 +268,28 @@ case in `reset_portfolio`).
 - `backend/app/portfolio/__init__.py`, `valuation.py`, `tracking.py`,
   `snapshotter.py` (new)
 - `backend/app/api/__init__.py`, `deps.py`, `schemas.py`, `errors.py`,
-  `health.py`, `portfolio.py`, `watchlist.py`, `trades.py`, `chat.py` (new)
+  `health.py`, `portfolio.py`, `watchlist.py`, `trades.py`, `chat.py`,
+  `history.py` (new; `chat.py` untouched after creation, per scope)
 - `backend/app/main.py` (new)
+- `backend/app/market/cache.py`, `models.py` (modified — follow-up
+  additions, see above; not new files)
 - `backend/tests/portfolio/__init__.py`, `conftest.py`,
   `test_valuation.py`, `test_tracking.py`, `test_snapshotter.py` (new)
 - `backend/tests/api/__init__.py`, `conftest.py`, `test_health.py`,
   `test_watchlist.py`, `test_portfolio.py`, `test_trades.py`,
-  `test_chat.py`, `test_static_mount.py` (new)
+  `test_chat.py`, `test_static_mount.py`, `test_history.py` (new)
+- `backend/tests/market/test_cache_history.py`,
+  `test_cache_day_change.py`, `test_models_day_change.py` (new; the
+  pre-existing `test_cache.py`/`test_models.py` were not edited)
 - `backend/pyproject.toml` (added `httpx` to the `dev` extra — required by
   `fastapi.testclient.TestClient`)
-- `planning/API_CONTRACT.md`, `planning/BACKEND_SUMMARY.md` (new)
+- `planning/API_CONTRACT.md`, `planning/BACKEND_SUMMARY.md` (new, then
+  updated twice for the two follow-ups)
 
-No files outside `backend/app/api/`, `backend/app/portfolio/`,
-`backend/app/main.py`, `backend/tests/api/`, `backend/tests/portfolio/`,
-`backend/pyproject.toml`, and these two planning docs were created or
-modified.
+No files outside `backend/app/api/` (excluding `chat.py`'s body),
+`backend/app/portfolio/`, `backend/app/main.py`,
+`backend/app/market/cache.py`, `backend/app/market/models.py`,
+`backend/tests/api/`, `backend/tests/portfolio/`, `backend/tests/market/`
+(new files only), `backend/pyproject.toml`, and these two planning docs
+were created or modified. `frontend/`, `Dockerfile`, and `scripts/` were
+never touched.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 
@@ -29,10 +30,21 @@ async def test_snapshot_loop_runs_periodically_until_cancelled():
     cache = PriceCache()
 
     task = asyncio.create_task(snapshot_loop(cache, interval=0.01))
-    await asyncio.sleep(0.05)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        # Poll for up to ~2s rather than a single fixed sleep -- a fixed
+        # sleep/interval ratio is flaky under slower execution (e.g. with
+        # coverage instrumentation), where fewer loop iterations complete
+        # in the same wall-clock window.
+        for _ in range(200):
+            if len(await get_snapshots()) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("snapshot_loop did not record 2 snapshots in time")
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
     snapshots = await get_snapshots()
     assert len(snapshots) >= 2

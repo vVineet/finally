@@ -8,7 +8,15 @@ Backend API Engineer rather than guessing.
 
 Implementation: `backend/app/api/` (routers), `backend/app/portfolio/`
 (valuation/tracking/snapshot logic), `backend/app/main.py` (app assembly).
-Tests: `backend/tests/api/`, `backend/tests/portfolio/`.
+`GET /api/history/{ticker}`, and the `day_change`/`day_change_percent`
+fields on the SSE stream, additionally depend on additions to
+`backend/app/market/cache.py` (`PriceCache`) and
+`backend/app/market/models.py` (`PriceUpdate`) — made by the Backend API
+Engineer as two follow-up passes after the original stage-2 brief omitted
+them, coordinated with the Market Data Engineer's existing, already-tested
+module. Tests: `backend/tests/api/`, `backend/tests/portfolio/`, and
+`backend/tests/market/test_cache_history.py` /
+`test_cache_day_change.py` / `test_models_day_change.py`.
 
 ## Conventions (binding, apply to every endpoint below)
 
@@ -20,7 +28,11 @@ Tests: `backend/tests/api/`, `backend/tests/portfolio/`.
   8601 string in UTC, e.g. `"2026-09-08T12:00:00.123456+00:00"` (Python's
   `datetime.now(UTC).isoformat()`). The only place epoch-seconds floats
   appear is inside SSE payloads from `/api/stream/prices` — never in a
-  response from an endpoint in this document.
+  response from an endpoint in this document. One endpoint,
+  `GET /api/history/{ticker}`, uses a `"...Z"` suffix instead of
+  `"...+00:00"` (still ISO 8601 UTC, millisecond precision) to match the
+  exact contract the Frontend Engineer is coding against — see that
+  section for the precise format.
 - **Errors (C5)**: every 4xx/5xx response body is `{"detail": <value>}`.
   For endpoints in this file, `<value>` is a plain string in the large
   majority of cases. The one exception: FastAPI's automatic request-body
@@ -72,6 +84,109 @@ Health check. Always 200 once the process is up.
 ```json
 {"status": "ok"}
 ```
+
+---
+
+## Market Data
+
+### SSE payload additions: `day_change` / `day_change_percent` (PLAN §13.A1)
+
+`GET /api/stream/prices` itself is unchanged and still owned by the market
+data component (`planning/MARKET_DATA_SUMMARY.md`) — this section
+documents two new fields inside each ticker's object in that stream's
+payload, added by the Backend API Engineer in a follow-up pass because
+§13.A1 named this a blocking gap that no stage had implemented.
+
+**Before (still present, unchanged):**
+```json
+{"AAPL": {"ticker": "AAPL", "price": 190.50, "previous_price": 190.00, "timestamp": 1736342523.5, "change": 0.50, "change_percent": 0.26, "direction": "up"}}
+```
+
+**Now (two fields added):**
+```json
+{"AAPL": {"ticker": "AAPL", "price": 190.50, "previous_price": 190.00, "timestamp": 1736342523.5, "change": 0.50, "change_percent": 0.26, "direction": "up", "day_change": 3.20, "day_change_percent": 1.71}}
+```
+
+- `change` / `change_percent` / `direction` are **unchanged** and still
+  tick-over-tick (change since the *previous* ~500ms update) — the
+  frontend's price-flash animation keys off these, exactly as before.
+- `day_change` / `day_change_percent` are **new**: the change from an
+  `open_price` captured once per ticker, computed the same way as
+  `change`/`change_percent` but against `open_price` instead of
+  `previous_price`.
+- **What "day" actually means here, precisely, so this is never mistaken
+  for a bug**: `open_price` is the price the ticker was first observed at
+  by this running process — at process start for the ten seeded
+  tickers, or on the first tick after being added later (including a
+  re-add after removal, which captures a brand-new open price, not the
+  old one). **This is not a true market previous-close.** There is no
+  session-open or previous-close concept anywhere in this system. Under
+  the simulator (the default), "open price" is simply whatever the GBM
+  walk happened to start at when the container booted — restart the
+  container and every `day_change` resets to zero from a new baseline.
+  Under `MASSIVE_API_KEY` real-data mode, it's still just "price at first
+  poll after this process started," not the exchange's actual previous
+  close, unless the process happens to have started before that session
+  opened. Label it in the UI as something like "since session start," not
+  "today's change" or "1D %".
+- Both are `0.0` (never an error, `NaN`, or a `ZeroDivisionError`) for a
+  ticker with no open price yet or whose open price is `0` — the same
+  defensive pattern `change_percent` already uses for `previous_price ==
+  0`.
+- Implementation: `PriceCache` (`app/market/cache.py`) now tracks
+  `open_price` per ticker in a dict separate from the main price map,
+  populated on a ticker's first `update()` call and cleared by
+  `remove()`. `PriceUpdate` (`app/market/models.py`) gained an optional
+  `open_price` field (defaulted to `None`, so every existing call site
+  and test that doesn't know about it is unaffected) plus the two new
+  computed properties, included in `to_dict()`. `app/market/stream.py`
+  (the actual SSE loop) was **not modified** — it already serializes
+  whatever `PriceUpdate.to_dict()` returns, so the new fields appear in
+  the stream automatically.
+
+### `GET /api/history/{ticker}`
+
+Server-side price history for one ticker — the single source of truth for
+both the watchlist sparklines and the main chart (PLAN §13.B13/C4), backed
+by a bounded per-ticker ring buffer inside `PriceCache`
+(`app/market/cache.py`, `HISTORY_MAXLEN = 600` ticks, about 5 minutes at
+the SSE stream's ~500ms cadence). This replaces accumulating history from
+`/api/stream/prices` since page load, which emptied on every refresh.
+
+**Path param**: `ticker` — normalized (stripped + uppercased) the same as
+everywhere else. No format validation is enforced here (unlike the
+watchlist/trade endpoints) — a garbage ticker simply has no history,
+handled identically to a real-but-untracked one (see below).
+
+**Query params**: `limit` (int, default `600`, `1 <= limit <= 600` — 600
+is both the default *and* the maximum, since the ring buffer never holds
+more than that).
+
+**Response `200`**
+```json
+{
+  "ticker": "AAPL",
+  "points": [
+    {"t": "2026-09-08T19:42:03.500Z", "price": 190.23},
+    {"t": "2026-09-08T19:42:04.001Z", "price": 190.31}
+  ]
+}
+```
+- `points` is oldest-first, ready to feed directly into a chart.
+- `t` is ISO 8601 UTC with millisecond precision and a literal `"Z"`
+  suffix — **not** `"+00:00"` like every other timestamp in this document
+  (the one deliberate exception to the A6 convention above, to match the
+  contract already being built against).
+- `price` is a plain float, already rounded to 2dp by `PriceCache`.
+- **An unknown ticker, or one with no ticks yet (just added to the
+  watchlist, before its first tick from the market data source), returns
+  `200` with `"points": []` — not a `404`.** This is a normal, expected
+  state the frontend must render as an empty chart, not an error.
+
+**Errors**
+| Status | When | `detail` |
+|---|---|---|
+| 422 | `limit` outside `1..600` | pydantic-derived message (C5's uniform shape still applies — this is the one real error case) |
 
 ---
 
