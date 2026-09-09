@@ -430,8 +430,8 @@ chat panel on load).
     {
       "id": "c3d4...",
       "role": "assistant",
-      "content": "Done — bought 10 AAPL at $200.00.",
-      "actions": {"trades": [{"ticker": "AAPL", "side": "buy", "quantity": 10, "status": "success"}]},
+      "content": "I'll buy 10 AAPL at the current price.",
+      "actions": {"trades_executed": [{"ticker": "AAPL", "side": "buy", "quantity": 10, "price": 200.0, "status": "success"}]},
       "created_at": "2026-09-08T12:00:01+00:00"
     }
   ]
@@ -442,24 +442,19 @@ assistant messages it's whatever JSON object was stored (parsed from the
 DB's `actions` TEXT column — the API layer does `json.loads`, the caller
 never sees a stringified-JSON-inside-JSON value).
 
-### `POST /api/chat` — **STUB, not yet implemented**
+### `POST /api/chat` — **implemented**
 
-The route is registered (`backend/app/api/chat.py`) and validates its
-request body, but the handler currently always returns:
+`backend/app/api/chat.py`, backed by `backend/app/llm/`. Full design
+(system prompt, structured output schema, mock catalogue, context/history
+budget) in `planning/LLM_DESIGN.md`.
 
-**Response `501`**
-```json
-{"detail": "Chat is not yet implemented. See planning/API_CONTRACT.md for the target contract."}
-```
-
-**Request contract (already enforced)**
+**Request**
 ```json
 {"message": "Should I buy more AAPL?"}
 ```
 `message`: non-empty string (422 if empty/missing).
 
-**Target response contract for the LLM Engineer to implement** (not yet
-built — this is the spec, not the current behavior):
+**Response contract**:
 
 ```json
 {
@@ -473,36 +468,69 @@ built — this is the spec, not the current behavior):
   "watchlist_changes": [
     {"ticker": "PYPL", "action": "add", "status": "success"}
   ],
-  "portfolio": { "...": "same shape as GET /api/portfolio" },
-  "watchlist": { "...": "same shape as GET /api/watchlist" }
+  "portfolio": {
+    "cash_balance": 8000.0,
+    "total_value": 10120.0,
+    "positions": ["... exact shape of GET /api/portfolio's \"positions\" array"],
+    "updated_at": "2026-09-08T12:00:05.001+00:00"
+  },
+  "watchlist": [
+    {"ticker": "AAPL", "added_at": "2026-09-08T00:00:00+00:00"}
+  ]
 }
 ```
+`portfolio` is the exact object `GET /api/portfolio` returns (unwrapped).
+`watchlist` is a **bare array** of `{ticker, added_at}` objects — the same
+shape `POST /api/portfolio/reset`'s `watchlist` field uses, *not*
+`GET /api/watchlist`'s `{"watchlist": [...]}` wrapper. (An earlier draft
+of this section used ambiguous `{"...": "same shape as X"}` placeholders
+here; that phrasing is what caused the ambiguity — this is the literal
+shape, spelled out, to avoid it recurring for the Integration Tester.)
 
-Design notes the LLM Engineer must follow (from PLAN §13.A3, decision
-(a)):
+**Errors**
+| Status | When | `detail` |
+|---|---|---|
+| 422 | `message` missing/empty | pydantic-derived message |
+| 503 | `OPENROUTER_API_KEY` unset/blank and `LLM_MOCK` isn't `"true"` — the assistant isn't configured at all | `"The AI assistant is not configured: OPENROUTER_API_KEY is missing. ..."` |
+| 502 | The real LLM call raised (network error, timeout, non-2xx/insufficient-credits from OpenRouter/Cerebras), or the model's output wasn't recoverable JSON (see below) | `"The AI assistant failed to produce a response. Please try again in a moment."` |
+
+A `502`/`503` is a normal error response (C5's uniform `{"detail": ...}`
+shape) — **never** a `200` carrying a synthetic assistant message. A fake
+"sorry, something went wrong" chat bubble would be indistinguishable from
+a genuine reply and would falsely read as the AI being evasive rather
+than the request having failed. On a `503`, nothing is persisted. On a
+`502`, the user's own message *is* persisted (`GET /api/chat/history`
+will show it), but no assistant turn is written — a synthetic apology
+persisted as an assistant message would re-enter the model's own context
+window on the next call (it's fed the last 20 stored messages) and the
+model would see itself apologizing for something that never happened.
+
+Design notes the LLM Engineer followed (from PLAN §13.A3, decision (a)):
 - **The LLM cannot know whether a trade will succeed before it writes
-  `message`.** Word the system prompt so the model never claims a trade is
-  *done* in `message` itself (say "I'll buy..." not "I bought..."); the
+  `message`.** The system prompt forbids the model from claiming a trade
+  is *done* in `message` itself ("I'll buy..." not "I bought..."); the
   *actual* outcome is reported in the separate `trades_executed` /
   `trades_failed` blocks, which the frontend renders as inline
-  confirmation/error chips distinct from the prose. Do not make a second
-  LLM call to "fix" the message after execution — one call, structured
-  execution results alongside it.
-- **Reuse this file's validated paths, don't reimplement them.** Each
-  trade in `trades` from the structured LLM output should go through the
-  exact same checks as `POST /api/portfolio/trade` in this document
-  (ticker format, positive finite quantity, price-cache presence,
+  confirmation/error chips distinct from the prose. No second LLM call to
+  "fix" the message after execution — one call, structured execution
+  results alongside it.
+- **Reuses this file's validated paths, doesn't reimplement them.** Each
+  trade in `trades` from the structured LLM output goes through the exact
+  same checks as `POST /api/portfolio/trade` in this document (ticker
+  format, positive finite quantity, price-cache presence,
   `app.db.execute_trade`, watchlist auto-add, tracked-ticker sync, and an
-  immediate snapshot) — call the same Python functions
+  immediate snapshot) via the same Python functions
   (`app.portfolio.sync_tracked_tickers`, `app.portfolio.snapshot_once`,
   `app.db.execute_trade`, `app.db.add_to_watchlist`) rather than
   duplicating the logic. Same for `watchlist_changes` against
   `app.db.add_to_watchlist` / `remove_from_watchlist`.
-- Persist both the user message and the assistant message via
-  `app.db.add_chat_message` (`actions` = `json.dumps(...)` of whatever
-  subset of `trades_executed`/`trades_failed`/`watchlist_changes` actually
-  ran; `None` for the user's own message).
-- Return the post-execution `portfolio`/`watchlist` per C2, exactly like
+- Persists the user message unconditionally (except on `503`), and the
+  assistant message only on a `200` (i.e. only when a real response was
+  produced and processed), via `app.db.add_chat_message` (`actions` =
+  `json.dumps(...)` of whatever subset of
+  `trades_executed`/`trades_failed`/`watchlist_changes` actually ran, or
+  `None` if nothing did; always `None` for the user's own message).
+- Returns the post-execution `portfolio`/`watchlist` per C2, exactly like
   the other mutating endpoints in this file.
 
 ---
